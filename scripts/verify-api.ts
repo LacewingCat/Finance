@@ -3,7 +3,6 @@ import { mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { parseEnv } from "node:util";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DatabaseSync } from "node:sqlite";
 import { AiService } from "../src/server/ai.js";
 import { Store, dataDirectory } from "../src/server/store.js";
 import { recordTransaction, d } from "../src/server/ledger.js";
@@ -12,11 +11,8 @@ import {
   REFERENCE_INSTRUMENTS,
 } from "../src/server/providers.js";
 import { amountCandidates } from "../src/server/risk.js";
-import {
-  BudgetError,
-  type BudgetStore,
-  type Reservation,
-} from "../src/server/budget.js";
+import type { Reservation } from "../src/server/budget.js";
+import { ProbeBudgetStore } from "../src/server/probe-budget.js";
 import { DEFAULT_SETTINGS } from "../src/server/config.js";
 import type {
   AppSettings,
@@ -84,7 +80,7 @@ if (!args.includes("--live")) {
       hardLimitUSD: d(limitArg).toFixed(2),
       database: DATABASE,
       matrix: args.includes("--extended") ? extendedStages : undefined,
-      note: "Use --live explicitly. Only synthetic ledgers. Live mode reads confirmed production credit fields only; never holdings or transactions.",
+      note: "Use --live explicitly. Only synthetic ledgers. Live mode shares production budget reservations and reads budget admission fields; never holdings or transactions.",
     }),
   );
 } else {
@@ -98,35 +94,9 @@ if (!args.includes("--live")) {
   mkdirSync(DIRECTORY, { recursive: true, mode: 0o700 });
   chmodSync(DIRECTORY, 0o700);
   const store = new Store(DATABASE);
-  // Read exactly the credit fields, never production holdings, transactions, keys or full settings.
-  const production = new DatabaseSync(join(dataDirectory(), "finance.sqlite"), {
-    readOnly: true,
-  });
-  let credit: Pick<
-    AppSettings,
-    "creditAmount" | "creditStartsAt" | "creditExpiresAt" | "creditConfirmed"
-  >;
-  try {
-    const row = production
-      .prepare(
-        "SELECT json_extract(value,'$.creditAmount') AS creditAmount, json_extract(value,'$.creditStartsAt') AS creditStartsAt, json_extract(value,'$.creditExpiresAt') AS creditExpiresAt, json_extract(value,'$.creditConfirmed') AS creditConfirmed FROM records WHERE namespace='settings' AND key='app'",
-      )
-      .get() as
-      | {
-          creditAmount: string;
-          creditStartsAt: string;
-          creditExpiresAt: string;
-          creditConfirmed: number;
-        }
-      | undefined;
-    if (!row || row.creditConfirmed !== 1)
-      throw new Error(
-        "Production credit dates and amount must already be confirmed",
-      );
-    credit = { ...row, creditConfirmed: true };
-  } finally {
-    production.close();
-  }
+  // Production expenses and probe membership are the single budget authority.
+  // No production settings, holdings, transactions, or keys are modified.
+  const production = new Store(join(dataDirectory(), "finance.sqlite"));
   const started = new Date();
   const now = () => new Date();
   const safe = (value: unknown) =>
@@ -140,50 +110,13 @@ if (!args.includes("--live")) {
           : item,
       ),
     );
-  const accounted = () =>
-    store
-      .list<Reservation>("ai-budget")
-      .reduce(
-        (n, r) =>
-          n +
-          (r.status === "settled"
-            ? (r.actualMicros ?? r.reservedMicros)
-            : r.status === "released"
-              ? 0
-              : r.reservedMicros),
-        0,
-      );
-  const guardedStore: BudgetStore = {
-    get: store.get.bind(store),
-    list: store.list.bind(store),
-    atomic: store.atomic.bind(store),
-    put(namespace, id, value) {
-      if (
-        namespace === "ai-budget" &&
-        (value as Reservation).status === "reserved"
-      ) {
-        const proposed = value as Reservation;
-        const existing = store
-          .list<Reservation>("ai-budget")
-          .filter((r) => r.id !== id)
-          .reduce(
-            (n, r) =>
-              n +
-              (r.status === "settled"
-                ? (r.actualMicros ?? r.reservedMicros)
-                : r.status === "released"
-                  ? 0
-                  : r.reservedMicros),
-            0,
-          );
-        if (existing + proposed.reservedMicros > HARD_LIMIT_MICROS)
-          throw new BudgetError(
-            "Lifetime probe hard limit exhausted; request not sent",
-          );
-      }
-      store.put(namespace, id, value);
-    },
-  };
+  const guardedStore = new ProbeBudgetStore(
+    production,
+    store,
+    HARD_LIMIT_MICROS,
+    now,
+  );
+  const accounted = () => guardedStore.accountedMicros();
   const save = () => {
     const providerUsage = store
       .list<Record<string, unknown>>("probe-provider-usage")
@@ -200,10 +133,10 @@ if (!args.includes("--live")) {
       database: DATABASE,
       hardLimitMicros: HARD_LIMIT_MICROS,
       accountedMicros: accounted(),
-      productionCreditFieldsReadOnly: true,
+      sharedProductionBudget: true,
       creditDeclaration:
-        "Confirmed credit admission fields only; no holdings or transactions read. Production grant details omitted from this export.",
-      reservations: store.list("ai-budget"),
+        "Production monthly limit and confirmed credit admission fields only; no holdings or transactions read. Expenses reserve and settle in the shared production budget. Grant details omitted from this export.",
+      reservations: guardedStore.records(),
       audits: store.list("ai-audit"),
       providerUsage,
       freeRequests: store.list("probe-free-requests"),
@@ -227,9 +160,8 @@ if (!args.includes("--live")) {
   };
   const settings: AppSettings = {
     ...structuredClone(DEFAULT_SETTINGS),
-    ...credit,
+    ...guardedStore.budgetFields(),
     apiEnabled: true,
-    monthlyLimit: d(limitArg).plus(5).toFixed(2),
     model: "gpt-6.1-sol",
     reasoning: "medium",
     monitoring: false,
@@ -271,11 +203,14 @@ if (!args.includes("--live")) {
       throw new Error("Probe endpoint not allowed");
     const requestId = new Headers(init?.headers).get("X-Client-Request-Id");
     const reservation = requestId
-      ? store.get<Reservation>("ai-budget", requestId)
+      ? guardedStore.get<Reservation>("ai-budget", requestId)
       : undefined;
-    // All lifetime records in this isolated database count, including other months and ambiguous failures.
+    // Ownership and reservation were committed together in the shared database.
+    // The probe cap includes its lifetime records, even across months/restarts.
     if (
       !reservation ||
+      !requestId ||
+      !guardedStore.owns(requestId) ||
       reservation.status !== "reserved" ||
       accounted() > HARD_LIMIT_MICROS
     )
@@ -869,9 +804,11 @@ if (!args.includes("--live")) {
         evidence: EVIDENCE,
         accountedMicros: accounted(),
         hardLimitMicros: HARD_LIMIT_MICROS,
-        productionUntouched: true,
+        productionFinancialLedgerUntouched: true,
+        sharedProductionBudget: true,
       }),
     );
     store.close();
+    production.close();
   }
 }
