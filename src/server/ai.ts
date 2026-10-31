@@ -335,19 +335,44 @@ export class AiService {
   async models(): Promise<AvailableModel[]> {
     const key = this.keyProvider();
     if (!key) throw new Error("尚未配置服务器端 API Key");
-    let response: Response;
-    try {
-      response = await this.fetcher("https://api.openai.com/v1/models", {
-        headers: { Authorization: `Bearer ${key}` },
-        signal: AbortSignal.timeout(15_000),
-        redirect: "error",
-      });
-    } catch {
-      throw new Error("无法读取 OpenAI 模型目录");
-    }
-    if (!response.ok)
+    let response: Response | undefined;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        response = await this.fetcher("https://api.openai.com/v1/models", {
+          headers: { Authorization: `Bearer ${key}` },
+          signal: AbortSignal.timeout(15_000),
+          redirect: "error",
+        });
+      } catch {
+        if (attempt === 0) continue;
+        throw new Error("无法读取 OpenAI 模型目录");
+      }
+      if (response.ok) break;
+      if (attempt === 0 && response.status >= 500) continue;
+      if (attempt === 0 && response.status === 429) {
+        const header = response.headers.get("retry-after"),
+          seconds =
+            header && /^\d+(?:\.\d+)?$/.test(header) ? Number(header) : NaN;
+        const delay = Number.isFinite(seconds)
+          ? seconds * 1000
+          : header
+            ? Date.parse(header) - this.now().getTime()
+            : NaN;
+        if (Number.isFinite(delay) && delay >= 0 && delay <= 2000) {
+          if (delay > 0)
+            await new Promise((resolve) => setTimeout(resolve, delay));
+          continue;
+        }
+      }
       throw new Error(`模型目录读取失败 (HTTP ${response.status})`);
-    const body = object(await response.json());
+    }
+    if (!response?.ok) throw new Error("无法读取 OpenAI 模型目录");
+    let body: ObjectValue;
+    try {
+      body = object(await response.json());
+    } catch {
+      throw new Error("模型目录格式无效");
+    }
     if (!Array.isArray(body.data)) throw new Error("模型目录格式无效");
     const ids = body.data
       .map((x) => object(x).id)
@@ -478,10 +503,27 @@ export class AiService {
       return data;
     } catch (error) {
       this.budgetManager.ambiguous(reservation.id);
-      const candidate = error as { name?: unknown; cause?: { code?: unknown }; code?: unknown } | null;
+      const candidate = error as {
+        name?: unknown;
+        cause?: { code?: unknown };
+        code?: unknown;
+      } | null;
       const code = candidate?.cause?.code ?? candidate?.code;
-      const transportCode = typeof code === "string" && /^[A-Z0-9_]{1,64}$/.test(code) ? code : undefined;
-      const errorName = typeof candidate?.name === "string" && ["TypeError", "TimeoutError", "AbortError", "SyntaxError", "BudgetError"].includes(candidate.name) ? candidate.name : "Error";
+      const transportCode =
+        typeof code === "string" && /^[A-Z0-9_]{1,64}$/.test(code)
+          ? code
+          : undefined;
+      const errorName =
+        typeof candidate?.name === "string" &&
+        [
+          "TypeError",
+          "TimeoutError",
+          "AbortError",
+          "SyntaxError",
+          "BudgetError",
+        ].includes(candidate.name)
+          ? candidate.name
+          : "Error";
       this.store.put("ai-audit", reservation.id, {
         ...this.store.get<ObjectValue>("ai-audit", reservation.id),
         status: "ambiguous",
@@ -503,6 +545,7 @@ export class AiService {
     settings: AppSettings,
     category: TaskCategory,
     extra: ObjectValue = {},
+    currentUserMessage?: string,
   ): Promise<ObjectValue> {
     const prompt = this.prompt(task);
     return this.call(
@@ -523,6 +566,9 @@ export class AiService {
               payload,
             }),
           },
+          ...(currentUserMessage === undefined
+            ? []
+            : [{ role: "user", content: currentUserMessage }]),
         ],
         ...extra,
       },
@@ -720,17 +766,15 @@ export class AiService {
       {
         snapshot,
         context,
-        currentUserMessage: message,
-        history: history
-          .slice(-12)
-          .map((h) => ({
-            role: h.role,
-            content: (h.content ?? h.text ?? "").slice(0, 2000),
-          })),
+        history: history.slice(-12).map((h) => ({
+          role: h.role,
+          content: (h.content ?? h.text ?? "").slice(0, 2000),
+        })),
       },
       settings,
       "chat",
       extra,
+      message,
     );
     const text = outputText(data);
     const calls = (Array.isArray(data.output) ? data.output : [])
